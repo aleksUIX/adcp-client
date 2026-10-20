@@ -183,6 +183,50 @@ export async function resolvePropertyList(
   return result;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function jsonRecordsFromContent(content: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(content)) return [];
+  const records: Record<string, unknown>[] = [];
+  for (const block of content) {
+    if (!isRecord(block) || block.type !== 'text' || typeof block.text !== 'string') continue;
+    try {
+      const parsed = JSON.parse(block.text) as unknown;
+      if (isRecord(parsed)) records.push(parsed);
+    } catch {
+      // The next text block may be the payload.
+    }
+  }
+  return records;
+}
+
+// callMCPTool returns a CallToolResult. The list payload is structuredContent,
+// or a JSON text block, or already the top-level object in tests.
+function toolResultPayload(raw: unknown, invalidCode: string): Record<string, unknown> {
+  if (!isRecord(raw)) {
+    throw new Error(invalidCode);
+  }
+  if (raw.isError === true) {
+    const structured = isRecord(raw.structuredContent) ? raw.structuredContent : undefined;
+    const fromText = jsonRecordsFromContent(raw.content).find(record => record.adcp_error !== undefined);
+    const adcpError = structured?.adcp_error ?? raw.adcp_error ?? fromText?.adcp_error;
+    const error = new Error(invalidCode);
+    if (adcpError !== undefined) {
+      error.cause = adcpError;
+    }
+    throw error;
+  }
+  // A top-level list must win over an unrelated JSON text block.
+  if (isRecord(raw.structuredContent)) {
+    return raw.structuredContent;
+  }
+  if ('list' in raw) return raw;
+  const records = jsonRecordsFromContent(raw.content);
+  return records.find(record => 'list' in record) ?? records[0] ?? raw;
+}
+
 async function fetchResolvedPropertyList(
   ref: PropertyListReference,
   options: ResolveListOptions
@@ -198,7 +242,10 @@ async function fetchResolvedPropertyList(
   for (let pageIndex = 0; pageIndex < maxPagesForOptions(options); pageIndex += 1) {
     const args = buildResolveListArgs(ref.list_id, pageSizeForOptions(options), cursor);
 
-    const raw = (await callTool(ref.agent_url, 'get_property_list', args, ref.auth_token)) as Record<string, unknown>;
+    const raw = toolResultPayload(
+      await callTool(ref.agent_url, 'get_property_list', args, ref.auth_token),
+      'property_list_invalid_response'
+    );
 
     if (!raw || typeof raw !== 'object' || !('list' in raw)) {
       throw new Error('property_list_invalid_response');
@@ -311,7 +358,10 @@ async function fetchResolvedCollectionList(
   for (let pageIndex = 0; pageIndex < maxPagesForOptions(options); pageIndex += 1) {
     const args = buildResolveListArgs(ref.list_id, pageSizeForOptions(options), cursor);
 
-    const raw = (await callTool(ref.agent_url, 'get_collection_list', args, ref.auth_token)) as Record<string, unknown>;
+    const raw = toolResultPayload(
+      await callTool(ref.agent_url, 'get_collection_list', args, ref.auth_token),
+      'collection_list_invalid_response'
+    );
 
     if (!raw || typeof raw !== 'object' || !('list' in raw)) {
       throw new Error('collection_list_invalid_response');

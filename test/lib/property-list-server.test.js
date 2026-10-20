@@ -5,7 +5,11 @@ const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
 const { InMemoryTransport } = require('@modelcontextprotocol/sdk/inMemory.js');
 const { registerPropertyListTool, sendPropertyListChanged } = require('../../dist/lib/server/property-lists');
-const { resolvePropertyList, createResolvedListCache } = require('../../dist/lib/server/targeting-helpers');
+const {
+  resolvePropertyList,
+  resolveCollectionList,
+  createResolvedListCache,
+} = require('../../dist/lib/server/targeting-helpers');
 const { runPropertyListConformance } = require('../../dist/lib/conformance/property-lists');
 const { createWebhookEmitter } = require('../../dist/lib/server/webhook-emitter');
 const { verifyWebhookSignature } = require('../../dist/lib/signing/webhook-verifier');
@@ -51,6 +55,88 @@ async function setup(t, loadPage) {
     },
   };
 }
+
+test('resolvePropertyList reads structuredContent from the MCP tool result', async t => {
+  const server = await setup(t, () => ({
+    list: { list_id: 'campaign', name: 'Campaign' },
+    identifiers: [{ type: 'domain', value: 'example.com' }],
+    pagination: { has_more: false },
+  }));
+  const reference = { agent_url: 'https://lists.example/mcp', list_id: 'campaign', auth_token: 'list-secret' };
+  const resolved = await resolvePropertyList(reference, {
+    callTool: (_url, _name, args, authToken) => server.call(args, authToken),
+    cache: false,
+  });
+  assert.equal(resolved.listId, 'campaign');
+  assert.deepEqual(resolved.identifiers, [{ type: 'domain', value: 'example.com' }]);
+  await assert.rejects(
+    () =>
+      resolvePropertyList(reference, {
+        callTool: () => server.call({ list_id: 'campaign' }, 'wrong-token'),
+        cache: false,
+      }),
+    /property_list_invalid_response/
+  );
+});
+
+test('resolvePropertyList keeps a top-level list ahead of an unrelated text block', async () => {
+  const resolved = await resolvePropertyList(
+    { agent_url: 'https://lists.example/mcp', list_id: 'pl-1', auth_token: 'token-a' },
+    {
+      cache: false,
+      callTool: async () => ({
+        list: { list_id: 'pl-1', name: 'Allow list' },
+        identifiers: [{ type: 'domain', value: 'news.example' }],
+        pagination: { has_more: false },
+        content: [{ type: 'text', text: JSON.stringify({ note: 'not the list' }) }],
+      }),
+    }
+  );
+  assert.equal(resolved.listId, 'pl-1');
+  assert.deepEqual(resolved.identifiers, [{ type: 'domain', value: 'news.example' }]);
+});
+
+test('resolvePropertyList carries adcp_error from an MCP error text block', async () => {
+  const adcpError = { code: 'not_found', message: 'missing list' };
+  await assert.rejects(
+    () =>
+      resolvePropertyList(
+        { agent_url: 'https://lists.example/mcp', list_id: 'pl-1', auth_token: 'token-a' },
+        {
+          cache: false,
+          callTool: async () => ({
+            isError: true,
+            content: [{ type: 'text', text: JSON.stringify({ adcp_error: adcpError }) }],
+          }),
+        }
+      ),
+    error => {
+      assert.equal(error.message, 'property_list_invalid_response');
+      assert.deepEqual(error.cause, adcpError);
+      return true;
+    }
+  );
+});
+
+test('resolveCollectionList reads structuredContent from an MCP tool result', async () => {
+  const resolved = await resolveCollectionList(
+    { agent_url: 'https://lists.example/mcp', list_id: 'cl-1', auth_token: 'token-a' },
+    {
+      cache: false,
+      callTool: async () => ({
+        content: [{ type: 'text', text: '{}' }],
+        structuredContent: {
+          list: { list_id: 'cl-1' },
+          collections: [{ collection_rid: 'col-1' }],
+          pagination: { has_more: false },
+        },
+        isError: false,
+      }),
+    }
+  );
+  assert.equal(resolved.listId, 'cl-1');
+  assert.deepEqual(resolved.collections, [{ collection_rid: 'col-1' }]);
+});
 
 test('registered MCP tool verifies per-list credentials on every page and resolves through seller helper', async t => {
   const calls = [];
